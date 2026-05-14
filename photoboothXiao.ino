@@ -1,15 +1,11 @@
 #include "esp_camera.h"
-#include <I2S.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <map>
-// #include <ei-project_inferencing.h>   // TODO: Edge Impulse
+#include <WebServer.h>
+#include <Seeed_Arduino_SSCMA.h>
 
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* SERVER_URL    = "http://192.168.1.100:5000/photo";
+const char* WIFI_SSID     = "UPV-PSK";
+const char* WIFI_PASSWORD = "Pr4ct1c4s-UPV!";
 
-// Camera pins (XIAO ESP32S3 Sense)
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  10
@@ -27,109 +23,63 @@ const char* SERVER_URL    = "http://192.168.1.100:5000/photo";
 #define HREF_GPIO_NUM  47
 #define PCLK_GPIO_NUM  13
 
-// Microphone pins
-#define I2S_WS  42
-#define I2S_SD  41
-#define I2S_SCK -1
+WebServer server(80);
+SSCMA AI;
 
-#define SAMPLE_RATE    16000
-#define SAMPLE_BITS    16
-#define MIC_BUFFER_LEN 512
-
-enum Filter {
-  FILTER_NONE       = 0,
-  FILTER_VINTAGE    = 1,
-  FILTER_BLACK_WHITE = 2,
-  FILTER_COLOR_POP  = 3,
-  FILTER_FACE_FRAME = 4
-};
-
-const char* filterNames[] = {
-  "none", "vintage", "blackWhite", "colorPop", "faceFrame"
-};
-
-Filter currentFilter = FILTER_NONE;
-bool   takePhoto     = false;
-int16_t audioBuffer[MIC_BUFFER_LEN];
-
-// ── Setup ────────────────────────────────────────────────────
+String last_detected_gesture = "none";
+int max_confidence = 0;
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
   initCamera();
-  initMicrophone();
   connectWifi();
-  Serial.println("[OK] Ready.");
+
+  if (!AI.begin()) {
+    Serial.println("[AI] Error");
+  }
+
+  server.on("/photo", HTTP_GET, handlePhoto);
+  server.begin();
 }
 
-// TODO: Remove after testing
-const std::map<char, Filter> keyToFilter = {
-  { 'f', FILTER_NONE        },
-  { 'v', FILTER_VINTAGE     },
-  { 'b', FILTER_BLACK_WHITE },
-  { 'c', FILTER_COLOR_POP   },
-  { 's', FILTER_FACE_FRAME  },
-};
-
-// TODO: Activate edge impulse
-const std::map<String, Filter> labelToFilter = {
-  { "photo",           FILTER_NONE        },
-  { "vintage",         FILTER_VINTAGE     },
-  { "black and white", FILTER_BLACK_WHITE },
-  { "color pop",       FILTER_COLOR_POP   },
-  { "face frame",      FILTER_FACE_FRAME  },
-};
-
-// ── Loop ─────────────────────────────────────────────────────
-
 void loop() {
-  // --- testing
-  if (Serial.available()) {
-    char c = Serial.read();
-    auto it = keyToFilter.find(c);
-    if (it != keyToFilter.end()) {
-      takePhoto     = true;
-      currentFilter = it->second;
+  server.handleClient();
+
+  if (AI.invoke() == 0) { 
+    String g_top = "none";
+    int s_top = 60;
+
+    for (auto& box : AI.boxes()) {
+      if (box.score > s_top) {
+        s_top = box.score;
+        if (box.target == 0 || String(box.label) == "rock") g_top = "rock";
+        else if (box.target == 1 || String(box.label) == "paper") g_top = "paper";
+        else if (box.target == 2 || String(box.label) == "scissors") g_top = "scissors";
+      }
     }
+    last_detected_gesture = g_top;
+    max_confidence = s_top;
   }
-
-  // --- EDGE IMPULSE ---
-  // int bytesRead = I2S.readBytes((char*)audioBuffer, sizeof(audioBuffer));
-  // if (bytesRead > 0) {
-  //   signal_t signal;
-  //   numpy::signal_from_buffer(audioBuffer, bytesRead / 2, &signal);
-  //   ei_impulse_result_t result;
-  //   run_classifier(&signal, &result, false);
-  //
-  //   String topLabel = "";
-  //   float  topScore = 0.7;   // confidence threshold
-  //   for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-  //     if (result.classification[i].value > topScore) {
-  //       topScore = result.classification[i].value;
-  //       topLabel = result.classification[i].label;
-  //     }
-  //   }
-  //   auto it = labelToFilter.find(topLabel);
-  //   if (it != labelToFilter.end()) {
-  //     takePhoto     = true;
-  //     currentFilter = it->second;
-  //   }
-  // }
-
-  if (takePhoto) {
-    takePhoto = false;
-    camera_fb_t* fb = captureFrame();
-    if (fb) {
-      sendPhoto(fb, currentFilter);
-      esp_camera_fb_return(fb);
-    }
-  }
-
   delay(10);
 }
 
-// ── Camera ───────────────────────────────────────────────────
+void handlePhoto() {
+  String filter = server.arg("filter");
+  if (filter == "") filter = "none";
+
+  camera_fb_t* fb = captureFrame();
+  if (!fb) {
+    server.send(500, "text/plain", "Error");
+    return;
+  }
+
+  server.sendHeader("X-Filter", filter);
+  server.sendHeader("X-Gesto", last_detected_gesture);
+  server.sendHeader("X-Confianza", String(max_confidence));
+
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
 
 void initCamera() {
   camera_config_t config;
@@ -153,12 +103,13 @@ void initCamera() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.fb_location  = CAMERA_FB_IN_PSRAM;
 
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_SVGA;
+    config.frame_size   = FRAMESIZE_QVGA;
     config.jpeg_quality = 10;
     config.fb_count     = 2;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
     config.frame_size   = FRAMESIZE_CIF;
     config.jpeg_quality = 12;
@@ -168,7 +119,6 @@ void initCamera() {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("[CAM] Init failed: 0x%x — check Tools > PSRAM > OPI PSRAM\n", err);
     while (true) delay(1000);
   }
 
@@ -179,53 +129,22 @@ void initCamera() {
 
 camera_fb_t* captureFrame() {
   camera_fb_t* fb = esp_camera_fb_get();
-  esp_camera_fb_return(fb);       // Discard first frame (often overexposed)
-  fb = esp_camera_fb_get();
-  if (!fb) Serial.println("[CAM] Frame capture failed");
+  if (!fb) {
+    return nullptr;
+  }
   return fb;
 }
 
-// ── Microphone ───────────────────────────────────────────────
-
-void initMicrophone() {
-  I2S.setAllPins(I2S_SCK, I2S_WS, I2S_SD, -1, -1);
-  if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
-    Serial.println("[MIC] Init failed — check Sense module connection");
-    while (true) delay(1000);
-  }
-}
-
-// ── WiFi & HTTP ──────────────────────────────────────────────
-
 void connectWifi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setSleep(false);
+
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts++ < 20) {
     delay(500);
-    Serial.print(".");
   }
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("\n[WIFI] Connected — %s\n", WiFi.localIP().toString().c_str());
-  else
-    Serial.println("\n[WIFI] Could not connect — continuing without WiFi");
-}
 
-void sendPhoto(camera_fb_t* fb, Filter filter) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] No WiFi — photo not sent");
-    return;
+    while (true) delay(1000);
   }
-
-  HTTPClient http;
-  String url = String(SERVER_URL) + "?filter=" + filterNames[filter];
-  http.begin(url);
-  http.addHeader("Content-Type", "image/jpeg");
-
-  int code = http.POST(fb->buf, fb->len);
-  if (code == HTTP_CODE_OK)
-    Serial.printf("[HTTP] OK — filter: %s\n", filterNames[filter]);
-  else
-    Serial.printf("[HTTP] Error %d\n", code);
-
-  http.end();
 }

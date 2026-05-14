@@ -1,45 +1,84 @@
 #!/usr/bin/env python3
 
 import os
+import requests
 import numpy as np
 from datetime import datetime
-from flask import Flask, request, jsonify
 import cv2
 
-app = Flask(__name__)
+ESP32_IP   = "172.18.188.140"  
+ESP32_URL  = f"http://{ESP32_IP}/photo"
 OUTPUT_DIR = "photobooth_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+FILTERS = {
+    "f": "none",
+    "v": "vintage",
+    "b": "blackWhite",
+    "c": "colorPop",
+}
 
-@app.route("/photo", methods=["POST"])
-def receive_photo():
-    filter_name = request.args.get("filter", "none")
-    jpeg_data   = request.data
+TRANSLATIONS = {
+    "rock": "ROCK ✊",
+    "paper": "PAPER ✋",
+    "scissors": "SCISSORS ✌️",
+    "none": "NONE 🚫"
+}
 
-    if not jpeg_data:
-        return jsonify({"error": "No image data"}), 400
+def main():
+    print("=== SenseCraft AI Photobooth ===")
+    print("Keys: [f] no filter  [v] vintage  [b] B&W  [c] colorPop  [q] quit")
+    print(f"ESP32 URL: {ESP32_URL}\n")
 
-    img = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    while True:
+        key = input("Filter > ").strip().lower()
+
+        if key == "q":
+            break
+
+        if key not in FILTERS:
+            print(f"Invalid key. Use: {list(FILTERS.keys())}")
+            continue
+
+        filter_name = FILTERS[key]
+        take_photo(filter_name)
+
+
+def take_photo(filter_name: str):
+    print(f"[→] Requesting frame with filter: {filter_name}")
+
+    try:
+        response = requests.get(ESP32_URL, params={"filter": filter_name}, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[✗] Connection error: {e}")
+        return
+
+    gesture_raw = response.headers.get("X-Gesto", "none")
+    confidence = response.headers.get("X-Confianza", "0")
+    gesture_text = TRANSLATIONS.get(gesture_raw, "UNKNOWN")
+
+    img = cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        return jsonify({"error": "Could not decode image"}), 400
+        print("[✗] Decode error")
+        return
 
-    print(f"[SERVER] Received {img.shape} — filter: {filter_name}")
+    print(f"[✓] Image received {img.shape} — Gesture: {gesture_text} ({confidence}%)")
 
     result = apply_filter(img, filter_name)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath  = f"{OUTPUT_DIR}/{timestamp}_{filter_name}.jpg"
-    cv2.imwrite(filepath, result)
-    print(f"[SERVER] Saved: {filepath}")
+    cv2.putText(result, f"Gesture: {gesture_text}", (20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-    cv2.imshow(f"Photobooth — {filter_name}", result)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath  = f"{OUTPUT_DIR}/{timestamp}_{gesture_raw}_{filter_name}.jpg"
+    cv2.imwrite(filepath, result)
+    print(f"[✓] Saved: {filepath}")
+
+    cv2.imshow(f"Photobooth — {gesture_text}", result)
     cv2.waitKey(3000)
     cv2.destroyAllWindows()
 
-    return jsonify({"ok": True, "filter": filter_name, "file": filepath})
-
-
-# ── Filters ──────────────────────────────────────────────────
 
 def apply_filter(img: np.ndarray, name: str) -> np.ndarray:
     filters = {
@@ -47,7 +86,6 @@ def apply_filter(img: np.ndarray, name: str) -> np.ndarray:
         "vintage":    vintage,
         "blackWhite": black_and_white,
         "colorPop":   color_pop,
-        "faceFrame":  face_frame,
     }
     return filters.get(name, filters["none"])(img)
 
@@ -80,23 +118,6 @@ def color_pop(img: np.ndarray) -> np.ndarray:
     return cv2.LUT(boosted, _s_curve_lut())
 
 
-def face_frame(img: np.ndarray) -> np.ndarray:
-    out      = img.copy()
-    detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces    = detector.detectMultiScale(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), 1.1, 5)
-
-    for (x, y, w, h) in faces:
-        cv2.rectangle(out, (x-10, y-10), (x+w+10, y+h+10), (0, 200, 255), 3)
-        cv2.putText(out, "CHEESE!", (x, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2)
-
-    h_img, w_img = out.shape[:2]
-    border = 20
-    cv2.rectangle(out, (border, border), (w_img-border, h_img-border), (255, 255, 255), border)
-    return out
-
-
-# ── Helpers ──────────────────────────────────────────────────
-
 def vignette(img_f: np.ndarray, strength: float = 0.5) -> np.ndarray:
     h, w   = img_f.shape[:2]
     xx, yy = np.meshgrid(np.arange(w) - w/2, np.arange(h) - h/2)
@@ -113,5 +134,4 @@ def _s_curve_lut() -> np.ndarray:
 
 
 if __name__ == "__main__":
-    print("Photobooth filter server running on :5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    main()
